@@ -37,13 +37,74 @@ var __generator = (this && this.__generator) || function (thisArg, body) {
 };
 exports.__esModule = true;
 exports.templateTags = void 0;
-var aws = require("aws-sdk");
 var Attribute;
 (function (Attribute) {
     Attribute["accessKeyId"] = "accessKeyId";
     Attribute["secretAccessKey"] = "secretAccessKey";
     Attribute["sessionToken"] = "sessionToken";
 })(Attribute || (Attribute = {}));
+// --- Consistent credential snapshot cache -----------------------------------
+//
+// An AWS IAM auth block invokes this template tag once per field (access key,
+// secret key, session token), so run() fires multiple times per request. ADA
+// rewrites ~/.aws/credentials in the background, and AWS temporary credentials
+// are a matched triplet that only validate together. Reading each field with
+// an independent SharedIniFileCredentials load can therefore mix an old access
+// key with a new secret/session token if ADA rotates mid-request, producing an
+// intermittent SigV4 "signature does not match" error.
+//
+// To prevent that, we load the full triplet once and serve all three fields
+// from a single snapshot, cached for a short TTL and keyed by profile name. We
+// cache the in-flight Promise (not just the resolved value) so concurrent field
+// renders within one request share the exact same load. Insomnia v13 runs
+// plugins in a persistent hidden process, so this module-level cache survives
+// across invocations; the short TTL keeps us picking up ADA rotations promptly.
+var CACHE_TTL_MS = 5000;
+var credsCache = new Map();
+function loadCredentials(profileName) {
+    var _this = this;
+    var now = Date.now();
+    var cached = credsCache.get(profileName);
+    if (cached && cached.expiresAt > now) {
+        return cached.promise;
+    }
+    // Insomnia v13 hardening: require Node dependencies inside the hook/helper
+    // (no top-level/entry-point requires) so they run in the plugin's
+    // Node-capable execution context.
+    var aws = require('aws-sdk');
+    var promise = (function () { return __awaiter(_this, void 0, void 0, function () {
+        var creds;
+        return __generator(this, function (_a) {
+            switch (_a.label) {
+                case 0:
+                    creds = new aws.SharedIniFileCredentials({ profile: profileName });
+                    // Ensure the profile is actually read from disk before we read fields
+                    // off it (the object is not guaranteed to be populated synchronously).
+                    return [4 /*yield*/, new Promise(function (resolve, reject) {
+                            creds.refresh(function (err) { return (err ? reject(err) : resolve()); });
+                        })];
+                case 1:
+                    // Ensure the profile is actually read from disk before we read fields
+                    // off it (the object is not guaranteed to be populated synchronously).
+                    _a.sent();
+                    return [2 /*return*/, {
+                            accessKeyId: creds.accessKeyId,
+                            secretAccessKey: creds.secretAccessKey,
+                            sessionToken: creds.sessionToken
+                        }];
+            }
+        });
+    }); })();
+    // Don't cache a transient failure for the full TTL; evict on rejection.
+    promise["catch"](function () {
+        var entry = credsCache.get(profileName);
+        if (entry && entry.promise === promise) {
+            credsCache["delete"](profileName);
+        }
+    });
+    credsCache.set(profileName, { promise: promise, expiresAt: now + CACHE_TTL_MS });
+    return promise;
+}
 exports.templateTags = [
     {
         name: 'awsprofilecreds',
@@ -77,10 +138,18 @@ exports.templateTags = [
         ],
         run: function (context, profileName, attribute) {
             return __awaiter(this, void 0, void 0, function () {
-                var creds;
+                var creds, value;
                 return __generator(this, function (_a) {
-                    creds = new aws.SharedIniFileCredentials({ profile: profileName });
-                    return [2 /*return*/, creds[attribute]];
+                    switch (_a.label) {
+                        case 0: return [4 /*yield*/, loadCredentials(profileName)
+                            // Return a plain, JSON-serializable string. Everything now crosses a
+                            // process boundary and is JSON-serialized in Insomnia v13.
+                        ];
+                        case 1:
+                            creds = _a.sent();
+                            value = creds[attribute];
+                            return [2 /*return*/, value == null ? '' : String(value)];
+                    }
                 });
             });
         }
